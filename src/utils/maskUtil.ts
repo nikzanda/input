@@ -1,10 +1,17 @@
-import type {
-  InputMaskDefinitions,
-  InputMaskPattern,
-  InputMaskState,
-} from '../interface';
+import type { InputMaskDefinitions, InputMaskPattern } from '../interface';
 
 type MaskToken = string | RegExp;
+
+export interface MaskSelection {
+  start: number;
+  end: number;
+}
+
+/** Displayed text and its selection before an edit. */
+export interface MaskEditState {
+  value: string;
+  selection: MaskSelection;
+}
 
 const defaultDefinitions: Record<string, RegExp> = {
   '0': /[0-9]/,
@@ -52,6 +59,17 @@ export function parseMask(
 
 function isSlot(token?: MaskToken): token is RegExp {
   return token !== undefined && typeof token !== 'string';
+}
+
+/** The literal text starting at `index` and the index after it. */
+function getLiteral(tokens: MaskToken[], index: number) {
+  let literal = '';
+  let end = index;
+  while (typeof tokens[end] === 'string') {
+    literal += tokens[end];
+    end += 1;
+  }
+  return { literal, end };
 }
 
 function getPlaceholder(placeholder: string | null, index: number) {
@@ -118,22 +136,20 @@ function fitsRemainingTokens(
   index: number,
 ) {
   let current = offset;
-  for (
-    let tokenIndex = index;
-    tokenIndex < tokens.length && current < value.length;
-    tokenIndex += 1
-  ) {
+  let tokenIndex = index;
+  while (tokenIndex < tokens.length && current < value.length) {
     const token = tokens[tokenIndex];
     if (typeof token === 'string') {
-      let literal = token;
-      while (typeof tokens[tokenIndex + 1] === 'string') {
-        literal += tokens[++tokenIndex];
-      }
+      const { literal, end } = getLiteral(tokens, tokenIndex);
       if (value.startsWith(literal, current)) {
         current += literal.length;
       }
-    } else if (token.test(value[current])) {
-      current += 1;
+      tokenIndex = end;
+    } else {
+      if (token.test(value[current])) {
+        current += 1;
+      }
+      tokenIndex += 1;
     }
   }
   return current === value.length;
@@ -165,10 +181,7 @@ function leavesHiddenPosition(
 
 /** Length of the leading literal prefix found at the start of `text`. */
 function getPrefixLength(text: string, tokens: MaskToken[]) {
-  let prefix = '';
-  for (let index = 0; typeof tokens[index] === 'string'; index += 1) {
-    prefix += tokens[index];
-  }
+  const { literal: prefix } = getLiteral(tokens, 0);
   if (text.startsWith(prefix)) {
     return prefix.length;
   }
@@ -230,38 +243,45 @@ export function formatMask(
   value: string,
   tokens: MaskToken[],
   placeholder: string | null,
-  showEmpty = false,
+  showEmpty: boolean,
+  /** Offset in `value` whose formatted position is returned as `caret`. */
+  caret = value.length,
 ) {
   const characters: (string | null)[] = tokens.map(() => null);
   let offset = 0;
   // A separator can only end a group of editable positions that received input.
   let groupHasInput = false;
+  // The last token that consumed text before `caret`.
+  let caretToken = -1;
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (typeof token === 'string') {
-      const literalStart = index;
-      let literal = token;
-      while (typeof tokens[index + 1] === 'string') {
-        literal += tokens[++index];
+      const { literal, end } = getLiteral(tokens, index);
+      const length =
+        index === 0
+          ? getPrefixLength(value, tokens)
+          : value.startsWith(literal, offset)
+            ? literal.length
+            : 0;
+      if (length && offset < caret) {
+        caretToken = index + Math.min(caret - offset, length) - 1;
       }
-      if (literalStart === 0) {
-        offset = getPrefixLength(value, tokens);
-      } else if (value.slice(offset, offset + literal.length) === literal) {
-        offset += literal.length;
-      }
+      offset += length;
+      index = end - 1;
       groupHasInput = false;
     } else {
       const cache = {};
       while (offset < value.length) {
         const character = value[offset];
-        if (character === getPlaceholder(placeholder, index)) {
-          offset += 1;
-          groupHasInput = true;
-          break;
-        }
-        if (token.test(character)) {
-          characters[index] = character;
+        const isPlaceholder = character === getPlaceholder(placeholder, index);
+        if (isPlaceholder || token.test(character)) {
+          if (!isPlaceholder) {
+            characters[index] = character;
+          }
+          if (offset < caret) {
+            caretToken = index;
+          }
           offset += 1;
           groupHasInput = true;
           break;
@@ -278,41 +298,38 @@ export function formatMask(
     }
   }
 
-  return renderMask(tokens, characters, placeholder, showEmpty);
+  const result = renderMask(tokens, characters, placeholder, showEmpty);
+  let caretIndex = caretToken + 1;
+  while (typeof tokens[caretIndex] === 'string') {
+    caretIndex += 1;
+  }
+  return { ...result, caret: result.positions[caretIndex] };
 }
 
-function findChange(
-  previous: InputMaskState,
-  current: InputMaskState,
-  direction: string,
-) {
+function findChange(previous: MaskEditState, value: string, direction: string) {
   const oldValue = previous.value;
-  const value = current.value;
-  let start = previous.selection?.start ?? 0;
-  let end = previous.selection?.end ?? start;
+  let { start, end } = previous.selection;
 
-  if (previous.selection) {
-    const removed = oldValue.length - value.length;
-    if (start === end && removed > 0) {
-      if (direction === 'backward') {
-        start = Math.max(0, start - removed);
-      } else if (direction === 'forward') {
-        end += removed;
-      }
+  const removed = oldValue.length - value.length;
+  if (start === end && removed > 0) {
+    if (direction === 'backward') {
+      start = Math.max(0, start - removed);
+    } else if (direction === 'forward') {
+      end += removed;
     }
-    const insertedLength = value.length - oldValue.length + end - start;
-    if (
-      insertedLength >= 0 &&
-      oldValue.slice(0, start) === value.slice(0, start) &&
-      oldValue.slice(end) === value.slice(start + insertedLength)
-    ) {
-      return {
-        start,
-        end,
-        inserted: value.slice(start, start + insertedLength),
-        fromSelection: true,
-      };
-    }
+  }
+  const insertedLength = value.length - oldValue.length + end - start;
+  if (
+    insertedLength >= 0 &&
+    oldValue.slice(0, start) === value.slice(0, start) &&
+    oldValue.slice(end) === value.slice(start + insertedLength)
+  ) {
+    return {
+      start,
+      end,
+      inserted: value.slice(start, start + insertedLength),
+      fromSelection: true,
+    };
   }
 
   start = 0;
@@ -342,20 +359,20 @@ function findChange(
 }
 
 export function editMask(
-  previous: InputMaskState,
-  current: InputMaskState,
+  previous: MaskEditState,
+  value: string,
   previousTokens: MaskToken[],
   tokens: MaskToken[],
   placeholder: string | null,
-  direction = '',
+  direction: string,
   /**
    * Read inserted text like a value, as for paste, drop or autofill, instead of
    * discarding characters that do not fit the next position, as when typing.
    */
-  parse = false,
+  parse: boolean,
 ) {
   const oldMask = formatMask(previous.value, previousTokens, placeholder, true);
-  const change = findChange(previous, current, direction);
+  const change = findChange(previous, value, direction);
   const oldSlots = previousTokens.flatMap((token, index) =>
     typeof token === 'string' ? [] : [index],
   );
@@ -393,11 +410,43 @@ export function editMask(
     !change.inserted &&
     change.end > change.start &&
     removed.size === 0 &&
-    previous.selection?.start === previous.selection?.end
+    previous.selection.start === previous.selection.end
   ) {
     const slot = direction === 'forward' ? start : start - 1;
     if (slot >= 0 && slot < oldSlots.length) {
       removed.add(slot);
+      start = slot;
+    }
+  }
+
+  // Typed characters only fill positions; values read from paste or autofill
+  // may include the literal prefix.
+  let insertedOffset =
+    parse && start === 0 ? getPrefixLength(change.inserted, tokens) : 0;
+
+  // A hidden empty position shares its offset with the next one. When typing a
+  // character it cannot take, use the next position at that offset that can,
+  // e.g. replacing `A` in `A2` for `0X0`. Values read from paste or autofill
+  // leave such positions empty instead.
+  const typed = parse ? undefined : change.inserted[0];
+  if (typed !== undefined) {
+    const accepts = (slot: number) =>
+      !!(tokens[slots[slot]] as RegExp | undefined)?.test(typed);
+    let slot = start;
+    while (
+      slot + 1 < oldSlots.length &&
+      oldMask.characters[oldSlots[slot]] === null &&
+      oldMask.positions[oldSlots[slot]] < oldMask.value.length &&
+      oldMask.positions[oldSlots[slot]] ===
+        oldMask.positions[oldSlots[slot + 1]] &&
+      !accepts(slot)
+    ) {
+      slot += 1;
+    }
+    if (
+      accepts(slot) &&
+      (oldMask.characters[oldSlots[slot]] === null || removed.has(slot))
+    ) {
       start = slot;
     }
   }
@@ -418,8 +467,6 @@ export function editMask(
     }
   });
 
-  let insertedOffset =
-    start === 0 ? getPrefixLength(change.inserted, tokens) : 0;
   let tailOffset = 0;
   let caret = slots[start] ?? tokens.length;
   let groupHasInput = false;

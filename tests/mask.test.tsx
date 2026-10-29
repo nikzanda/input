@@ -325,6 +325,15 @@ describe('Input.mask', () => {
     expect(input.value).toBe('12/mm/yyyy');
   });
 
+  it('uses `_` beyond a shorter placeholder string', () => {
+    const { input } = renderInput({
+      mask: '00/00/0000',
+      defaultValue: '12',
+      maskPlaceholder: 'dd/mm',
+    });
+    expect(input.value).toBe('12/mm/____');
+  });
+
   it('shows an empty mask on focus and hides it on blur', async () => {
     const { input, container } = renderInput({
       allowClear: true,
@@ -574,20 +583,65 @@ describe('Input.mask', () => {
     expect(onChange.mock.calls[0][0].target.value).toBe('A3');
   });
 
-  it('ignores edits that cannot be displayed without placeholders', async () => {
+  it.each(['defaultValue', 'paste'] as const)(
+    'ignores edits that cannot be displayed without placeholders (%s)',
+    async (source) => {
+      const user = userEvent.setup();
+      const onChange = jest.fn();
+      const { input } = renderInput({
+        mask: '0X0 0',
+        defaultValue: source === 'defaultValue' ? 'A 1' : undefined,
+        onChange,
+      });
+      await user.click(input);
+      if (source === 'paste') {
+        await user.paste('A 1');
+      }
+      expect(input.value).toBe('A 1');
+      onChange.mockClear();
+      input.setSelectionRange(2, 2);
+      await user.keyboard('{Backspace}');
+      expect(input.value).toBe('A 1');
+      expect(input.selectionStart).toBe(2);
+      expect(onChange).not.toHaveBeenCalled();
+    },
+  );
+
+  it('replaces a selected character after a hidden empty position', async () => {
     const onChange = jest.fn();
     const { input } = renderInput({
-      mask: '0X0 0',
-      defaultValue: 'A 1',
+      mask: '0X0',
+      defaultValue: '1A2',
       onChange,
     });
     await userEvent.click(input);
-    input.setSelectionRange(2, 2);
-    await userEvent.keyboard('{Backspace}');
-    expect(input.value).toBe('A 1');
-    expect(input.selectionStart).toBe(2);
-    expect(onChange).not.toHaveBeenCalled();
+    input.setSelectionRange(0, 0);
+    await userEvent.keyboard('{Delete}');
+    expect(input.value).toBe('A2');
+    input.setSelectionRange(0, 1);
+    await userEvent.keyboard('B');
+    expect(input.value).toBe('B2');
+    expect(input.selectionStart).toBe(1);
+    expect(onChange.mock.calls.map(([event]) => event.target.value)).toEqual([
+      'A2',
+      'B2',
+    ]);
   });
+
+  it.each([
+    ['X00', '1234', '12', 'A12'],
+    ['X0X 0X0', '1B2C3', '1B 2C3', 'A1B 2C3'],
+  ])(
+    'leaves hidden positions empty when %s starts with a later position: %s',
+    async (mask, defaultValue, formatted, typed) => {
+      const { input } = renderInput({ mask, defaultValue });
+      expect(input.value).toBe(formatted);
+      await userEvent.click(input);
+      input.setSelectionRange(0, 0);
+      await userEvent.keyboard('A');
+      expect(input.value).toBe(typed);
+    },
+  );
 
   it.each([
     ['00X0', '12A3', [0, 2], 'A3'],
@@ -748,9 +802,40 @@ describe('Input.mask', () => {
   });
 
   it('does not consume input matching a prefix that starts with an editable character', async () => {
+    const user = userEvent.setup();
     const { input } = renderInput({ mask: '39 000' });
-    await userEvent.type(input, '3');
+    await user.type(input, '3');
     expect(input.value).toBe('39 3');
+    const { input: pastedInput } = renderInput({ mask: '39 000' });
+    await user.click(pastedInput);
+    await user.paste('3');
+    expect(pastedInput.value).toBe('39 3');
+  });
+
+  it('keeps characters when backspacing over the literal prefix', async () => {
+    const onChange = jest.fn();
+    const { input } = renderInput({
+      mask: '+39 000',
+      defaultValue: '1',
+      onChange,
+    });
+    await userEvent.click(input);
+    input.setSelectionRange(4, 4);
+    await userEvent.keyboard('{Backspace}');
+    expect(input.value).toBe('+39 1');
+    expect(input.selectionStart).toBe(4);
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('fills positions with typed characters that match the literal prefix', async () => {
+    const onChange = jest.fn();
+    const { input } = renderInput({ mask: '100', onChange });
+    await userEvent.type(input, '12');
+    expect(input.value).toBe('112');
+    expect(onChange.mock.calls.map(([event]) => event.target.value)).toEqual([
+      '11',
+      '112',
+    ]);
   });
 
   it('handles replacing the value through autofill', () => {
@@ -863,6 +948,159 @@ describe('Input.mask', () => {
     expect(input.value).toBe('12-34');
   });
 
+  it('formats the existing text when a dynamic mask leaves an empty pattern', async () => {
+    const mask: InputMask = ({ value }) => (value.length > 4 ? '00-000' : '');
+    const onChange = jest.fn();
+    const { input } = renderInput({ mask, onChange });
+    await userEvent.type(input, '12345');
+    expect(input.value).toBe('12-345');
+    expect(input.selectionStart).toBe(6);
+    expect(onChange.mock.calls.map(([event]) => event.target.value)).toEqual([
+      '1',
+      '12',
+      '123',
+      '1234',
+      '12-345',
+    ]);
+
+    const { input: middleInput } = renderInput({ mask });
+    await userEvent.type(middleInput, '1235');
+    middleInput.setSelectionRange(3, 3);
+    await userEvent.keyboard('4');
+    expect(middleInput.value).toBe('12-345');
+    expect(middleInput.selectionStart).toBe(5);
+  });
+
+  it.each(['uncontrolled', 'controlled'] as const)(
+    'keeps the empty pattern when activating a dynamic mask would be ambiguous (%s)',
+    async (mode) => {
+      const mask: InputMask = ({ value }) => (value.length > 1 ? '01XX' : '');
+      const onChange = jest.fn();
+      const Demo = () => {
+        const [value, setValue] = React.useState('');
+        return (
+          <Input
+            mask={mask}
+            {...(mode === 'controlled' ? { value } : {})}
+            onChange={(event) => {
+              onChange(event.target.value);
+              setValue(event.target.value);
+            }}
+          />
+        );
+      };
+      const { container } = render(<Demo />);
+      const input = container.querySelector('input')!;
+      await userEvent.type(input, 'AB');
+      // `1AB` would be read back as `11AB`, so the edit is ignored.
+      expect(input.value).toBe('A');
+      expect(input.selectionStart).toBe(1);
+      expect(onChange.mock.calls).toEqual([['A']]);
+      await userEvent.keyboard('2');
+      expect(input.value).toBe('21');
+      expect(onChange.mock.calls).toEqual([['A'], ['21']]);
+    },
+  );
+
+  it('formats the existing text when composition activates a dynamic mask', async () => {
+    const onChange = jest.fn();
+    const { input } = renderInput({
+      mask: ({ value }) => (value.length > 4 ? '00-000' : ''),
+      onChange,
+    });
+    await userEvent.type(input, '1234');
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, { target: { value: '12345' } });
+    fireEvent.compositionEnd(input);
+    expect(input.value).toBe('12-345');
+    expect(onChange.mock.calls.map(([event]) => event.target.value)).toEqual([
+      '1',
+      '12',
+      '123',
+      '1234',
+      '12345',
+      '12-345',
+    ]);
+  });
+
+  it.each([
+    ['ends', ['1234'], []],
+    ['continues', ['12'], ['1234']],
+  ])(
+    'formats a composition that %s after a mask is enabled',
+    (_, before, after) => {
+      const onChange = jest.fn();
+      const { container, rerender } = render(<Input onChange={onChange} />);
+      const input = container.querySelector('input')!;
+      fireEvent.compositionStart(input);
+      before.forEach((value) => {
+        fireEvent.change(input, { target: { value } });
+      });
+      rerender(<Input mask="0-000" onChange={onChange} />);
+      after.forEach((value) => {
+        fireEvent.change(input, { target: { value } });
+      });
+      fireEvent.compositionEnd(input);
+      expect(input.value).toBe('1-234');
+      expect(onChange.mock.calls.map(([event]) => event.target.value)).toEqual([
+        ...before,
+        ...after,
+        '1-234',
+      ]);
+    },
+  );
+
+  it.each([
+    ['2', '2'],
+    ['A', ''],
+  ])(
+    'ignores an ambiguous composition after a mask is enabled, restoring %j as %j',
+    (before, restored) => {
+      const onChange = jest.fn();
+      const { container, rerender } = render(<Input onChange={onChange} />);
+      const input = container.querySelector('input')!;
+      fireEvent.compositionStart(input);
+      fireEvent.change(input, { target: { value: before } });
+      rerender(<Input mask="001XX" onChange={onChange} />);
+      fireEvent.change(input, { target: { value: 'AB' } });
+      fireEvent.compositionEnd(input);
+      // `1AB` would be read back as `11AB`, filling digits that were never
+      // entered. `A` alone has the same problem, so the input is cleared.
+      expect(input.value).toBe(restored);
+      expect(onChange.mock.calls.map(([event]) => event.target.value)).toEqual([
+        before,
+        'AB',
+        restored,
+      ]);
+    },
+  );
+
+  it('maps the caret when restoring text composed before a mask is enabled', async () => {
+    const onChange = jest.fn();
+    const { container, rerender } = render(<Input onChange={onChange} />);
+    const input = container.querySelector('input')!;
+    act(() => input.focus());
+    fireEvent.compositionStart(input);
+    fireEvent.change(input, {
+      target: { value: '23', selectionStart: 2, selectionEnd: 2 },
+    });
+    rerender(<Input mask="0-01XX" onChange={onChange} />);
+    fireEvent.change(input, {
+      target: { value: 'AB', selectionStart: 2, selectionEnd: 2 },
+    });
+    fireEvent.compositionEnd(input);
+    expect(input.value).toBe('2-31');
+    expect(input.selectionStart).toBe(4);
+    await userEvent.keyboard('B');
+    expect(input.value).toBe('2-31B');
+    expect(onChange.mock.calls.map(([event]) => event.target.value)).toEqual([
+      '23',
+      'AB',
+      '2-31',
+      '2-31B',
+    ]);
+  });
+
   it('passes selection to dynamic masks and retains the selected mask after rendering', () => {
     const mask = jest.fn(({ selection }: InputMaskState) =>
       selection?.start === 1 ? 'X0' : '00',
@@ -959,6 +1197,24 @@ describe('Input.mask', () => {
     expect(input.value).toBe('123');
   });
 
+  it('applies count.exceedFormatter when a dynamic mask returns an empty pattern', async () => {
+    const user = userEvent.setup();
+    const { input } = renderInput({
+      mask: () => '',
+      count: {
+        max: 3,
+        exceedFormatter: (value, { max }) => value.slice(0, max),
+      },
+    });
+    await user.click(input);
+    await user.paste('12345');
+    expect(input.value).toBe('123');
+    expect(input.selectionStart).toBe(3);
+    await user.keyboard('4');
+    expect(input.value).toBe('123');
+    expect(input.selectionStart).toBe(3);
+  });
+
   it('applies count.exceedFormatter to the formatted value', async () => {
     const onChange = jest.fn();
     const { input } = renderInput({
@@ -985,6 +1241,26 @@ describe('Input.mask', () => {
       '1_-__',
       '12-__',
       '12-3_',
+    ]);
+  });
+
+  it('ignores a count.exceedFormatter result that would be read back differently', async () => {
+    const onChange = jest.fn();
+    const { input } = renderInput({
+      mask: '01XX',
+      count: { max: 3, exceedFormatter: (value) => value.replace(/\d/g, '') },
+      onChange,
+    });
+    await userEvent.type(input, '2A');
+    expect(input.value).toBe('21A');
+    await userEvent.keyboard('B');
+    // Removing the digits leaves `AB`, which would be shown as `1AB` and read
+    // back as `11AB`.
+    expect(input.value).toBe('21A');
+    expect(input.selectionStart).toBe(3);
+    expect(onChange.mock.calls.map(([event]) => event.target.value)).toEqual([
+      '21',
+      '21A',
     ]);
   });
 

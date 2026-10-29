@@ -56,7 +56,6 @@ const Input = forwardRef<InputRef, InputProps>((props, ref) => {
 
   const inputRef = useRef<HTMLInputElement>(null);
   const holderRef = useRef<HolderRef>(null);
-  const compositionEndValueRef = useRef<string>(undefined);
 
   const focus = (option?: InputFocusOptions) => {
     if (inputRef.current) {
@@ -139,32 +138,23 @@ const Input = forwardRef<InputRef, InputProps>((props, ref) => {
     if (info.source === 'compositionEnd' && currentValue === nextValue) {
       // Avoid triggering twice
       // https://github.com/ant-design/ant-design/issues/46587
-      return nextValue;
+      return;
     }
     if (
       maskConfig.hasMask &&
       !compositionRef.current &&
       nextValue === (maskConfig.hasInput ? maskConfig.displayValue : '')
     ) {
-      return nextValue;
+      return;
     }
     setValue(nextValue);
 
     if (inputRef.current) {
       resolveOnChange(inputRef.current, e, onChange, nextValue);
     }
-    return nextValue;
   };
 
   const onInternalChange: React.ChangeEventHandler<HTMLInputElement> = (e) => {
-    if (
-      maskConfig.hasMask &&
-      compositionEndValueRef.current === e.target.value
-    ) {
-      compositionEndValueRef.current = undefined;
-      return;
-    }
-    compositionEndValueRef.current = undefined;
     triggerChange(e, e.target.value, {
       source: 'change',
     });
@@ -174,17 +164,13 @@ const Input = forwardRef<InputRef, InputProps>((props, ref) => {
     e: React.CompositionEvent<HTMLInputElement>,
   ) => {
     compositionRef.current = false;
-    const nextValue = triggerChange(e, e.currentTarget.value, {
+    triggerChange(e, e.currentTarget.value, {
       source: 'compositionEnd',
     });
-    if (maskConfig.hasMask) {
-      compositionEndValueRef.current = nextValue;
-    }
     onCompositionEnd?.(e);
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    compositionEndValueRef.current = undefined;
     if (maskConfig.hasMask) {
       maskConfig.recordSelection(
         e.key === 'Backspace'
@@ -229,7 +215,6 @@ const Input = forwardRef<InputRef, InputProps>((props, ref) => {
   };
 
   const handleReset = (e: React.MouseEvent<HTMLElement, MouseEvent>) => {
-    compositionEndValueRef.current = undefined;
     maskConfig.reset();
     setValue('');
     focus();
